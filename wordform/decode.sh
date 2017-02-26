@@ -1,0 +1,1 @@
+python wordform.py --train_dir=/data/korpora_train --data_dir=/data/korpora --size=512 --num_layers=2 --vacab_size=3000 --steps_per_checkpoint=100 --learning_rate=1.0 --learning_rate_decay_factor=0.95 --decode
