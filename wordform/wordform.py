@@ -47,6 +47,8 @@ FLAGS = tf.app.flags.FLAGS
 # See seq2seq_model.Seq2SeqModel for details of how they work.
 _buckets = [(5, 5), (10, 10), (20, 20), (40, 40)]
 
+_buckets_loss = [300, 300, 300, 300]
+
 
 STOP_WORD = re.compile("[\s|\d]+")
 
@@ -79,6 +81,17 @@ def load_pair_data(file_name):
             data.append(re.split("[\r|\n|\s|\|]+",l)[::2])
     return [d for d in data if len(d) == 2 and "/" not in d[0]]
 #pair = load_pair_data("./data/autobild_1_02_2013_0_pair.txt")
+
+def log_data(*logs):
+    #print(logs)
+    s = ""
+    for l in logs:
+        s += "%s\t"%l
+    log_str(s)
+    
+def log_str(log_str):
+    with tf.gfile.GFile(FLAGS.train_dir+"/train.log", mode="a") as f:
+        f.write("%s\n"%log_str)
 
 def load_pair_data_from_dir(dir_path):
     pair = []
@@ -133,8 +146,9 @@ def prepare_korpora_data(data_dir, vocabulary_size):
   """
   # Get wmt data to the specified directory.
   train_path, dev_path = get_korpora_data_set(data_dir)
-  #tokenizer = char_tokenizer
-  tokenizer = bigram_tokenizer
+  tokenizer = char_tokenizer
+  print("using char tokenizer")
+  #tokenizer = bigram_tokenizer
 
   # Create vocabularies of the appropriate sizes.
   target_vocab_path = os.path.join(data_dir, "vocab%d.target" % vocabulary_size)
@@ -216,6 +230,7 @@ def create_model(session, forward_only):
     model.saver.restore(session, ckpt.model_checkpoint_path)
   else:
     print("Created model with fresh parameters.")
+    os.makedirs(FLAGS.train_dir)
     session.run(tf.initialize_all_variables())
   return model
 
@@ -230,7 +245,7 @@ def ids2str(ids, rev_vocab):
     return string
 
     
-def evaluate_valid(model, session, dev_set, printed_size):
+def evaluate_valid(model, session, dev_set, current_step, printed_size):
     # Load vocabularies.
     input_vocab_path = os.path.join(FLAGS.data_dir,
                                  "vocab%d.input" % FLAGS.vocab_size)
@@ -251,6 +266,8 @@ def evaluate_valid(model, session, dev_set, printed_size):
           eval_ppx = math.exp(float(eval_loss)) if eval_loss < 300 else float(
               "inf")
           print("  eval: bucket %d perplexity %.2f" % (bucket_id, eval_ppx))
+          log_data("dev_loss", current_step, model.global_step.eval(), eval_loss, bucket_id, eval_ppx)
+          _buckets_loss[bucket_id] = eval_loss
           valid_input = np.transpose(encoder_inputs)
           valid_decode = np.transpose(decoder_inputs)
           for i in range(len(valid_input)):
@@ -269,6 +286,18 @@ def evaluate_valid(model, session, dev_set, printed_size):
           sys.stdout.flush()
     return eval_datas
 
+def calc_buckects_scale(train_bucket_sizes):
+    train_bucket_sizes_loss = np.multiply(np.sqrt(train_bucket_sizes), _buckets_loss)
+    train_total_size = float(sum(train_bucket_sizes_loss))
+
+    # A bucket scale is a list of increasing numbers from 0 to 1 that we'll use
+    # to select a bucket. Length of [scale[i], scale[i+1]] is proportional to
+    # the size if i-th training bucket, as used later.
+    train_buckets_scale = [sum(train_bucket_sizes_loss[:i + 1]) / train_total_size
+                           for i in xrange(len(train_bucket_sizes_loss))]
+    print("train_buckets_scale: %s" % train_buckets_scale)
+    return train_buckets_scale
+
 def train():
   print("Preparing korpora data in %s" % FLAGS.data_dir)
   en_train, fr_train, en_dev, fr_dev, _, _ = prepare_korpora_data(
@@ -285,13 +314,7 @@ def train():
     dev_set = read_data(en_dev, fr_dev)
     train_set = read_data(en_train, fr_train, FLAGS.max_train_data_size)
     train_bucket_sizes = [len(train_set[b]) for b in xrange(len(_buckets))]
-    train_total_size = float(sum(train_bucket_sizes))
-
-    # A bucket scale is a list of increasing numbers from 0 to 1 that we'll use
-    # to select a bucket. Length of [scale[i], scale[i+1]] is proportional to
-    # the size if i-th training bucket, as used later.
-    train_buckets_scale = [sum(train_bucket_sizes[:i + 1]) / train_total_size
-                           for i in xrange(len(train_bucket_sizes))]
+    train_buckets_scale = calc_buckects_scale(train_bucket_sizes)
 
     # This is the training loop.
     step_time, loss = 0.0, 0.0
@@ -313,6 +336,7 @@ def train():
       step_time += (time.time() - start_time) / FLAGS.steps_per_checkpoint
       loss += step_loss / FLAGS.steps_per_checkpoint
       current_step += 1
+      log_data("step_loss", current_step, model.global_step.eval(), step_loss, bucket_id)
 
       # Once in a while, we save checkpoint, print statistics, and run evals.
       if current_step % FLAGS.steps_per_checkpoint == 0:
@@ -321,6 +345,8 @@ def train():
         print ("global step %d learning rate %.4f step-time %.2f perplexity "
                "%.2f" % (model.global_step.eval(), model.learning_rate.eval(),
                          step_time, perplexity))
+        log_data("checkpoint_loss", current_step, model.global_step.eval(), loss, 
+                 model.learning_rate.eval(),step_time,perplexity)
         # Decrease learning rate if no improvement was seen over last 3 times.
         if len(previous_losses) > 2 and loss > max(previous_losses[-3:]):
           sess.run(model.learning_rate_decay_op)
@@ -342,7 +368,9 @@ def train():
                 ids2str(np.transpose(encoder_inputs)[i][::-1], rev_input_vocab),
                 ids2str(np.transpose(decoder_inputs)[i], rev_target_vocab))
             
-        evaluate_valid(model, sess, dev_set, 10)
+        evaluate_valid(model, sess, dev_set, current_step, 10)
+        #recalculate bucket proporation based on dev error, in order to focus on bad bucket
+        train_buckets_scale = calc_buckects_scale(train_bucket_sizes)
 
 
 def decode():
